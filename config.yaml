@@ -1,0 +1,383 @@
+# =============================================================================
+# config.yaml  (camera-ready)
+# -----------------------------------------------------------------------------
+# Single source of truth for the project:
+#   "Cooling first, decarbonizing second? Urban heat island thresholds in the
+#    digital productivity-carbon efficiency coupling across China's Yangtze
+#    River Economic Belt"
+#
+# Every path, variable mapping, and hyperparameter used anywhere in the
+# codebase is declared here. No analytical constant is hard-coded in a .py file.
+#
+# Conventions
+#   * Monetary series are deflated to `preprocess.base_year` constant prices.
+#   * DEA inputs/outputs MUST be strictly positive after preprocessing.
+#   * Indicator `direction: positive` means "larger is better".
+#
+# -----------------------------------------------------------------------------
+# CHANGELOG  (revisions from the line-by-line reading-notes audit; the options
+# chosen below are the recommended defaults for this paper's context)
+# -----------------------------------------------------------------------------
+#  [DATA] cdd now derived from 2-m AIR temperature (ERA5-Land), NOT MODIS
+#         surface LST. Reason (Yang 2024): CDD is an air-temperature integral;
+#         surface LST overstates the canopy signal ~2x, and sharing the SUHII
+#         LST source would induce a mechanical treatment->mediator correlation.
+#  [DATA] cdd_base_temp_c set to 18 C (international CDD convention); 26 C
+#         (China's recommended AC setpoint) retained as a robustness axis.
+#  [DATA] SUHII facet fixed explicitly: clear-sky SURFACE, DAYTIME, AQUA
+#         (~13:30 overpass = peak-afternoon heat, best cooling-mechanism fit),
+#         ANNUAL mean as headline; Terra / all-sky / summer kept as robustness.
+#  [CEE ] returns_to_scale made explicit (CRS); optional CFG directional-
+#         distance CEE robustness (compute_ddf_robustness) + Spearman check;
+#         super-SBM infeasibility falls back to the SBM score.
+#  [CCD ] Shi et al. (2025) five-class coordination cut-offs added for
+#         descriptive comparability with the closest competing paper.
+#  [THR ] Hansen (1999): block-by-individual bootstrap; sigma^2 = SSR/[n(T-1)]
+#         for the gamma CI; LR CI for EVERY adopted threshold; F2+ bootstrap
+#         errors drawn from the alternative-model residuals; optional
+#         heteroskedasticity-robust block-bootstrap gamma CI.
+#  [SDM ] Lee & Yu (2010): small-T bias correction (demeaned Jacobian +
+#         (n-1)(T-1) dof). LeSage-Pace simulation-based SEs for the
+#         direct/indirect/total effects.
+#  [DML ] Nie & Wager (2021) R-learner: second-difference roughness penalty on
+#         the spline, lambda by city-grouped CV on the R-loss; Chernozhukov
+#         et al. (2018) S-split median; overlap diagnostic E[V^2|SUHII].
+#  [ID  ] Seo & Shin (2016): Hausman test deciding whether SUHII must be
+#         treated as an endogenous threshold; lngdp-vs-suhii head-to-head.
+# =============================================================================
+
+project: "cooling-first-decarb"
+seed: 20240101            # global RNG seed (synthetic generation + bootstraps;
+                          # DEA, entropy and CCD point estimates are deterministic)
+
+# -----------------------------------------------------------------------------
+# Filesystem layout (relative to the repository root)
+# -----------------------------------------------------------------------------
+paths:
+  raw_dir:       "data/raw"          # user-supplied source CSVs (see `raw` block)
+  interim_dir:   "data/interim"      # intermediate merge artifacts
+  processed_dir: "data"              # final panel lives here
+  panel_file:    "data/panel_yreb.parquet"
+  metadata_file: "data/city_metadata.csv"
+  outputs_dir:   "outputs"           # tables / summaries
+  figures_dir:   "outputs/figures"   # publication figures (visualize.py)
+  log_file:      "outputs/pipeline.log"
+
+# -----------------------------------------------------------------------------
+# Study scope: balanced panel of YREB prefecture-level cities
+#   Window 2011-2020 is intentional and one year earlier than Shi et al. (2025,
+#   2012-2021): bounded below by PKU-DFIIC availability (2011) and above by
+#   open-source overlap (2020). Same 10-year length, shifted by one year.
+# -----------------------------------------------------------------------------
+study:
+  start_year: 2011
+  end_year:   2020
+  n_cities:   110          # balanced YREB sample (Li et al., 2024, SCS)
+
+panel:
+  id_col:   "city_id"      # stable integer key
+  name_col: "city_name"
+  time_col: "year"
+  geo_cols: ["lon", "lat"]
+  reach_col: "reach"       # {upper, middle, lower}
+
+# Province -> reach assignment, per the Outline of the YREB Development Plan
+# (matches the 11 provinces/municipalities used by Shi et al., 2025).
+reaches:
+  upper:  ["Chongqing", "Sichuan", "Guizhou", "Yunnan"]
+  middle: ["Jiangxi", "Hubei", "Hunan"]
+  lower:  ["Shanghai", "Jiangsu", "Zhejiang", "Anhui"]
+
+# -----------------------------------------------------------------------------
+# Raw source files (long format, one row per city-year unless noted).
+# Filenames are resolved against paths.raw_dir. Columns listed are REQUIRED;
+# optional robustness columns are noted in comments.
+# -----------------------------------------------------------------------------
+raw:
+  metadata:
+    file: "metadata.csv"
+    columns: ["city_id", "city_name", "province", "lon", "lat"]
+  co2:                      # CEADs city inventories (Shan et al. 2018/2019) -> total CO2
+    file: "co2.csv"
+    columns: ["city_id", "year", "co2"]
+  yearbook:                 # China City Statistical Yearbook
+    file: "yearbook.csv"
+    columns: ["city_id", "year",
+              "labor", "capital", "energy", "gdp",
+              "mobile_penetration", "internet_penetration",
+              "postal_per_capita", "telecom_per_capita", "ict_employment_share",
+              "scitech_expenditure_share", "patents_5g", "patents_ecommerce",
+              "university_teachers",
+              "popd", "urbanization", "industrial_structure",
+              "gov_support", "greenery"]
+  dfi:                      # PKU Digital Financial Inclusion Index (Guo et al., 2020)
+    file: "dfi.csv"
+    columns: ["city_id", "year", "dfi_breadth", "dfi_depth", "dfi_digitization"]
+  suhii:                    # Global UHII (Yang, 2024): annual clear-sky SURFACE DAYTIME (Aqua) UHII.
+    file: "suhii.csv"       # Optional robustness facets (same file): suhii_terra, suhii_allsky, suhii_summer.
+    columns: ["city_id", "year", "suhii"]
+  cdd:                      # Cooling degree-days from ERA5-Land 2-m AIR temperature (NOT surface LST).
+    file: "cdd.csv"         # Must be source-independent of `suhii` to keep the mediation channel clean.
+    columns: ["city_id", "year", "cdd"]
+  deflators:                # OPTIONAL: national CPI (base = preprocess.base_year)
+    file: "deflators.csv"
+    columns: ["year", "cpi"]
+
+# -----------------------------------------------------------------------------
+# Preprocessing
+# -----------------------------------------------------------------------------
+preprocess:
+  deflate: true
+  base_year: 2011
+  monetary_cols: ["gdp", "capital", "telecom_per_capita",
+                  "postal_per_capita", "gov_support"]
+  winsorize: true
+  winsor_limits: [0.01, 0.99]          # pooled, per-column clipping
+  winsor_cols: ["labor", "capital", "energy", "gdp", "co2",
+                "patents_5g", "patents_ecommerce", "university_teachers",
+                "popd", "cdd"]
+  drop_incomplete_cities: true         # enforce a strictly balanced panel
+
+# -----------------------------------------------------------------------------
+# Carbon emission efficiency (super-efficiency SBM with undesirable output)
+#   Inputs   : labour, capital, energy
+#   Desired  : GDP
+#   Undesired: CO2
+# References: Tone (2001) SBM; Tone (2002) super-SBM; Tone (2003) undesirable
+#   output; Chung-Fare-Grosskopf (1997) for the disposability axioms and the
+#   directional-distance robustness variant.
+# -----------------------------------------------------------------------------
+carbon_efficiency:
+  inputs:            ["labor", "capital", "energy"]
+  desired_outputs:   ["gdp"]
+  undesired_outputs: ["co2"]
+  frontier: "annual"            # {annual, pooled}: contemporaneous vs meta-frontier
+  returns_to_scale: "crs"       # {crs, vrs}; CRS = no sum(lambda)=1 constraint.
+                                # VRS is a one-row change (Tone 2002 sec.6.3); state which in the paper.
+  super_efficiency: true        # discriminate among efficient DMUs (score >= 1)
+  infeasible_fallback: "sbm"    # super-SBM infeasible (Seiford-Zhu 1999) -> keep the SBM score (=1), never NaN
+  compute_ddf_robustness: true  # also compute the CFG directional-distance CEE and report Spearman rank corr
+  solver: "highs"               # scipy.optimize.linprog backend
+  epsilon: 1.0e-9               # numerical floor (keeps Charnes-Cooper t > 0 well away from the bound)
+  efficient_tol: 1.0e-6         # |rho - 1| <= tol  => treat as frontier DMU
+  output_col: "cee"
+  ddf_output_col: "cee_ddf"     # directional-distance robustness score E = 1/(1+beta*) in (0,1]
+
+# -----------------------------------------------------------------------------
+# Digital productivity (entropy-weighted composite index)
+#   Four dimensions / twelve indicators (Li et al., 2024, SCS, Table 1).
+#   Finance sub-indices = PKU-DFIIC (Guo et al., 2020), identical to Shi (2025).
+# -----------------------------------------------------------------------------
+digital_productivity:
+  method: "entropy"
+  normalization: "minmax"   # per-column min-max prior to entropy weighting
+  output_col: "dp"
+  indicators:
+    - {name: "mobile_penetration",        direction: "positive", dimension: "infrastructure"}
+    - {name: "internet_penetration",      direction: "positive", dimension: "infrastructure"}
+    - {name: "postal_per_capita",         direction: "positive", dimension: "industrialization"}
+    - {name: "telecom_per_capita",        direction: "positive", dimension: "industrialization"}
+    - {name: "ict_employment_share",      direction: "positive", dimension: "industrialization"}
+    - {name: "scitech_expenditure_share", direction: "positive", dimension: "innovation"}
+    - {name: "patents_5g",                direction: "positive", dimension: "innovation"}
+    - {name: "patents_ecommerce",         direction: "positive", dimension: "innovation"}
+    - {name: "university_teachers",       direction: "positive", dimension: "innovation"}
+    - {name: "dfi_breadth",               direction: "positive", dimension: "finance"}
+    - {name: "dfi_depth",                 direction: "positive", dimension: "finance"}
+    - {name: "dfi_digitization",          direction: "positive", dimension: "finance"}
+
+# -----------------------------------------------------------------------------
+# Coupling coordination degree between DP (U1) and CEE (U2)
+#   C = 2*sqrt(U1*U2)/(U1+U2)     coupling degree
+#   T = alpha*U1 + beta*U2        comprehensive coordination index
+#   D = sqrt(C*T)                 coupling coordination degree (the outcome)
+# Both subsystems are min-max normalized to [0,1] before coupling.
+# -----------------------------------------------------------------------------
+coupling:
+  alpha: 0.5
+  beta:  0.5
+  normalize_subsystems: "minmax"
+  ccd_col: "ccd"
+  # Shi et al. (2025) five-class cut-offs, for descriptive comparability only
+  # (no effect on any model). Buckets are [min, max).
+  classes:
+    - {label: "moderate_dysregulation", max: 0.40}
+    - {label: "mild_dysregulation",     min: 0.40, max: 0.50}
+    - {label: "low_coordination",       min: 0.50, max: 0.60}
+    - {label: "moderate_coordination",  min: 0.60, max: 0.70}
+    - {label: "high_coordination",      min: 0.70}
+
+# -----------------------------------------------------------------------------
+# Heat / threshold + cooling-channel variable contract (fixed at the data layer)
+# -----------------------------------------------------------------------------
+heat:
+  threshold_var: "suhii"                         # Hansen threshold / DML moderator
+  suhii_facet: "clear_sky_surface_daytime_aqua"  # Yang(2024) IMyd1, ~13:30 overpass (peak-afternoon heat)
+  suhii_aggregation: "annual_mean"               # headline; summer (JJA) available as robustness
+  cooling_channel: "cdd"                         # mediation variable ("cooling tax")
+  cdd_source: "era5_land_2m_airtemp"             # 2-m AIR temperature; independent of the SUHII surface LST
+  cdd_base_temp_c: 18.0                          # international CDD base; 26 C (China AC setpoint) = robustness
+
+# -----------------------------------------------------------------------------
+# Synthetic data generator (for CI / reproducibility when raw files are absent).
+# Tuned so the pipeline exercises every downstream model non-degenerately:
+# CDD carries an independent (air-temperature) component AND a planted
+# cooling-tax channel into CEE, so the mediation test is meaningful on synthetic
+# data (the previous version made CDD a deterministic function of SUHII).
+# -----------------------------------------------------------------------------
+synthetic:
+  noise_sd: 0.08                  # multiplicative log-normal noise
+  suhii_trend_per_year: 0.05      # deg C/yr upward drift (warming)
+  cdd_per_suhii: 120.0            # shared climate component: CDD response to SUHII
+  cdd_noise_sd: 40.0              # INDEPENDENT CDD variation (air temp != surface LST)
+  cee_cdd_coef: -0.05             # planted cooling-tax channel CDD -> CEE (makes mediation testable)
+
+# -----------------------------------------------------------------------------
+# Stage 3a -- linear panel benchmark (threshold_models.fe_benchmark)
+#   Two-way (city + year) FE, cluster-robust SE by city. `lngdp` = log(gdp).
+# -----------------------------------------------------------------------------
+benchmark:
+  outcome: "ccd"                 # also run with "cee" as a robustness outcome
+  core_regressor: "dp"
+  controls: ["lngdp", "popd", "urbanization",
+             "industrial_structure", "gov_support", "greenery"]
+  time_effects: true             # city + year FE
+  cluster: "city_id"
+
+# -----------------------------------------------------------------------------
+# Stage 3b -- Hansen (1999) fixed-effects panel threshold model
+#   Outcome regressed on regime-dependent `regime_regressors` whose slope
+#   switches across regimes defined by `threshold_var` (= SUHII); `controls`
+#   enter with regime-invariant coefficients.
+# -----------------------------------------------------------------------------
+threshold:
+  outcome: "ccd"                 # headline: DP -> coupling under heat regimes
+  threshold_var: "suhii"
+  regime_regressors: ["dp"]      # regime-dependent slope(s)
+  controls: ["lngdp", "popd", "urbanization",
+             "industrial_structure", "gov_support", "greenery"]
+  time_effects: true             # city + year FE (two-way within)
+  cluster: "city_id"
+  max_thresholds: 2              # sequential search: 1 then (if added) 2
+  trim: 0.05                     # trim threshold grid to the [0.05, 0.95] quantiles
+  min_regime_frac: 0.10          # each regime must hold >= 10% of observations
+  max_grid: 150                  # cap grid size for tractable bootstrap
+  bootstrap_reps: 300            # Hansen residual bootstrap replications
+  select_alpha: 0.05             # significance level for adopting an extra threshold
+  alpha_ci: 0.95                 # confidence level for the threshold CI
+  # ---- camera-ready Hansen corrections (see CHANGELOG [THR]) ----
+  bootstrap_method: "block"      # {block, iid}: block-by-individual residual resampling (Hansen sec.4.1)
+  df_correction: true            # sigma^2 = SSR / [n*(T-1)] for the LR gamma CI (Hansen Eq.10)
+  alt_residual_bootstrap: true   # F2+ : y* from (k-1)-fit, errors from the k-threshold (alternative) fit (Eq.21)
+  report_all_cis: true           # LR confidence interval for EVERY adopted threshold (sec.5.3)
+  gamma_ci_bootstrap: true       # additionally report a heteroskedasticity-robust block-bootstrap gamma CI
+  gamma_ci_bootstrap_reps: 499   # reps for the robust gamma CI
+
+# -----------------------------------------------------------------------------
+# Stage 3c -- instrumental-variables robustness (threshold_models.fe_2sls)
+#   Instruments MUST be time-varying (the within transform annihilates time-
+#   invariant geography). Supply e.g. terrain-ruggedness x year, or ventilation
+#   x national-temperature-anomaly, as panel columns. Empty by default: the
+#   headline relies on the Seo-Shin exogeneity test (see `endogeneity`) rather
+#   than on instruments that are not yet constructed.
+# -----------------------------------------------------------------------------
+iv:
+  outcome: "ccd"
+  endogenous: "dp"               # or "suhii" for threshold-variable endogeneity
+  instruments: []                # e.g. ["rugged_x_year", "wind_x_anomaly"]
+  exog_controls: ["lngdp", "popd", "urbanization",
+                  "industrial_structure", "gov_support", "greenery"]
+  time_effects: true
+  cluster: "city_id"
+
+# -----------------------------------------------------------------------------
+# Stage 3d -- causal ML: data-driven recovery of the heat-moderated effect.
+#   The R-learner of Nie & Wager (2021): Robinson-residualized, cross-fitted
+#   nuisances + an R-loss spline final stage recovering theta(SUHII) without
+#   imposing the kink. Corroborates the Hansen threshold from Stage 3b.
+# -----------------------------------------------------------------------------
+causal_ml:
+  outcome: "ccd"
+  treatment: "dp"
+  moderator: "suhii"
+  confounders: ["lngdp", "popd", "urbanization",
+                "industrial_structure", "gov_support", "greenery"]
+  time_effects: true             # partial out city + year FE before DML
+  cluster: "city_id"
+  n_folds: 5                     # cross-fitting folds (grouped by city)
+  nuisance: "hgb"                # {hgb, rf}: nuisance learner family
+  spline_knots: 6                # B-spline knots for theta(SUHII)
+  spline_degree: 3
+  grid_points: 60                # evaluation grid for the theta(SUHII) curve
+  trim: 0.05                     # evaluate the curve on the [0.05, 0.95] q-range
+  alpha_ci: 0.95
+  use_causal_forest: false       # set true to also run econml CausalForestDML
+  forest_trees: 2000             # econml forest size (if enabled)
+  # ---- camera-ready R-learner / DML refinements (see CHANGELOG [DML]) ----
+  spline_penalty: true           # second-difference roughness penalty Omega(tau) on the spline coefs
+  spline_penalty_lambda: "cv"    # {"cv", <float>}: select lambda by city-grouped CV on the R-loss
+  lambda_grid: [0.0, 0.1, 1.0, 10.0, 100.0]   # candidate penalties for CV
+  n_repeats: 5                   # repeat the cross-fit split S times; report median estimate + adj. variance
+  report_overlap: true           # report residual-treatment variance E[V^2|SUHII] (local-overlap diagnostic)
+
+# -----------------------------------------------------------------------------
+# Stage 4 -- spatial spillovers, cooling-tax mechanism, and warming dynamics
+# (spatial_mechanism.py). Self-contained ML Spatial Durbin Model; Moran's I;
+# FE mediation through cooling demand; regime-crossing over time.
+# -----------------------------------------------------------------------------
+spatial:
+  outcome: "ccd"
+  regressors: ["dp", "lngdp", "popd", "urbanization", "industrial_structure"]
+  weights: "geographic"          # {geographic, economic}
+  knn: 0                         # 0 -> inverse-distance; k>0 -> k-nearest binary
+  distance_decay: 1.0            # inverse-distance exponent
+  economic_level: "lngdp"        # variable defining economic-distance weights
+  fe: "twoway"                   # {twoway, entity, none}
+  rho_bounds: [-0.99, 0.99]
+  # ---- camera-ready Lee & Yu (2010) + LeSage-Pace (see CHANGELOG [SDM]) ----
+  bias_correction: true          # demeaned Jacobian -(T-1)*log(1-rho) + (n-1)(T-1) dof for small T
+  effects_n_sim: 1000            # LeSage-Pace parameter draws for direct/indirect/total effect SEs
+  effects_alpha_ci: 0.95         # confidence level for the simulated effect CIs
+
+mediation:                       # the "cooling tax": heat -> cooling demand -> CEE
+  treatment: "suhii"
+  mediator: "cdd"                # ERA5-Land air-temperature CDD (independent of the SUHII surface LST)
+  outcome: "cee"
+  controls: ["dp", "lngdp", "popd", "urbanization", "industrial_structure"]
+  fe: "twoway"
+  cluster: "city_id"
+  bootstrap_reps: 1000
+  standardize_mediator: true     # z-score CDD: makes a,b interpretable and conditions the bootstrap
+                                 # (indirect a*b is scale-invariant, so the estimate is unchanged)
+
+dynamics:                        # regime crossing as cities warm
+  suhii_col: "suhii"
+  gamma: null                    # SUHII threshold; if null, threaded from Stage 3b (or --gamma, or median)
+
+# -----------------------------------------------------------------------------
+# Stage 5 -- endogeneity of the threshold variable (Seo & Shin, 2016).
+#   Decision rule BEFORE any heavy re-architecting: test whether SUHII must be
+#   treated as an endogenous threshold. Hausman t_H compares gamma from FD-GMM
+#   (endogeneity-robust) and FD-2SLS (valid only if SUHII is exogenous). If the
+#   test does not reject, the headline Hansen model stands and this is a single
+#   robustness paragraph. FD-GMM is a large-n/fixed-T estimator and at N=110,
+#   T=10 it is many-instruments territory -> cap the lag order (Roodman 2009).
+# -----------------------------------------------------------------------------
+endogeneity:
+  test_threshold_exogeneity: true   # run the Seo-Shin Hausman test on SUHII
+  gmm_lag_cap: 4                     # cap instrument lag order (avoid instrument proliferation)
+  lagged_suhii_robustness: true      # also re-run the threshold with lagged SUHII as a simple check
+  alpha: 0.05
+
+# -----------------------------------------------------------------------------
+# Robustness matrix -- alternative specifications run as supplementary columns.
+#   threshold_vars: the head-to-head that positions the paper against Shi (2025)
+#     and the conventional income-threshold literature (Bai/Du/Chua) -- show the
+#     binding nonlinearity is thermal (SUHII), not economic (lngdp).
+#   suhii_facets: Yang (2024) facet swaps (must exist as panel columns).
+# -----------------------------------------------------------------------------
+robustness:
+  threshold_vars: ["suhii", "lngdp"]
+  suhii_facets:   ["suhii", "suhii_terra", "suhii_allsky", "suhii_summer"]
+  outcomes:       ["ccd", "cee"]
+  cdd_base_temps: [18.0, 26.0]

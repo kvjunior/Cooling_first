@@ -1,0 +1,64 @@
+# =============================================================================
+# environment.yml
+# -----------------------------------------------------------------------------
+# Reproducible environment for:
+#   "Cooling first, decarbonizing second? Urban heat island thresholds in the
+#    digital productivity-carbon efficiency coupling across China's YREB"
+#
+# IMPORTANT (CentOS 7 / GCC 4.8.5): install from conda-forge so every package
+# arrives as a PREBUILT binary. Do NOT use `pip install` for the compiled
+# scientific stack on this host -- the system GCC 4.8.5 is too old to build
+# modern wheels (econml, recent scikit-learn, libpysal/spreg) from source.
+#
+# Create / update / activate:
+#   conda env create -f environment.yml      # or: mamba env create -f environment.yml
+#   conda activate cooling-first-decarb
+#
+# If the solver reports a conflict, relax the most-pinned ML packages
+# (econml, scikit-learn) before touching numpy/scipy/pandas.
+# =============================================================================
+name: cooling-first-decarb
+
+channels:
+  - conda-forge
+  - nodefaults
+
+dependencies:
+  # ---- core scientific stack (data_pipeline.py, measurement.py) ----
+  - python=3.11
+  - numpy>=1.26,<2.1          # <2.1 keeps econml/linearmodels compatibility
+  - scipy>=1.11               # provides the HiGHS LP backend used by DEA
+  - pandas>=2.1,<2.3
+  - pyarrow>=14               # parquet I/O for the panel
+  - pyyaml>=6.0
+
+  # ---- econometrics (threshold_models.py, spatial_mechanism.py) ----
+  - statsmodels>=0.14
+  - linearmodels>=5.4         # panel FE / IV cross-checks
+  - libpysal>=4.9             # spatial weights (W) for SDM / Moran's I
+  - esda>=2.5                 # Moran's I and spatial autocorrelation
+  - spreg>=1.4                # spatial Durbin / spatial panel regression
+
+  # ---- causal ML (causal_ml.py): data-driven threshold recovery ----
+  - scikit-learn>=1.3,<1.6
+  - econml>=0.15              # DML / causal (generalized random) forests
+  - joblib>=1.3               # parallelism across the 64 CPU cores
+  - tqdm>=4.66
+
+  # ---- geospatial + plotting (visualize.py: regime maps, threshold plots) ----
+  - geopandas>=0.14
+  - matplotlib>=3.7
+  - seaborn>=0.13
+
+  # ---- developer tooling ----
+  - pytest>=7.4               # runs the verification tests
+  - black>=24.0
+  - ruff>=0.4
+
+  # OPTIONAL (only for the neural varying-coefficient robustness check that
+  # exploits the 4x RTX 3090 GPUs). Uncomment and match your CUDA driver, then
+  # `conda env update -f environment.yml`. econml itself is CPU-bound, so the
+  # default environment above does not require CUDA.
+  # - pytorch>=2.1
+  # - pytorch-cuda=12.1
+  # - cudatoolkit
